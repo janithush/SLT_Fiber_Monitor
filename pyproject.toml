@@ -1,0 +1,10 @@
+[project]
+name = "slt-monitor"
+version = "0.1.0"
+description = "SLT Broadband background data monitor for Rainmeter"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.34.2",
+    "playwright>=1.40.0",
+]
