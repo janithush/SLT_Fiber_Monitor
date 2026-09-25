@@ -420,7 +420,7 @@ def update_data_cycle():
             print("[!] Still expired after re-login. Keeping last-good values.")
             last = load_last_good()
             now = time.strftime("%I:%M:%S %p")
-            write_variables_inc(last, "expired", now)
+            write_variables_inc(last, "Session Expired", now)
             return
 
     if res is not None and res.status_code == 200:
@@ -429,12 +429,12 @@ def update_data_cycle():
         except Exception:
             print("[!] Non-JSON response (possible Incapsula block).")
             last = load_last_good()
-            write_variables_inc(last, "error", time.strftime("%I:%M:%S %p"))
+            write_variables_inc(last, "Sync Failed", time.strftime("%I:%M:%S %p"))
             return
         if not isinstance(payload, dict) or not payload.get("dataBundle"):
             print(f"[!] Unexpected payload: {str(payload)[:200]}")
             last = load_last_good()
-            write_variables_inc(last, "error", time.strftime("%I:%M:%S %p"))
+            write_variables_inc(last, "Sync Failed", time.strftime("%I:%M:%S %p"))
             return
         data = parse_usage(payload)
         now = time.strftime("%I:%M:%S %p")
@@ -454,7 +454,7 @@ def update_data_cycle():
         print(f"[!] Fetch failed with status: {status}")
         last = load_last_good()
         try:
-            write_variables_inc(last, "error", time.strftime("%I:%M:%S %p"))
+            write_variables_inc(last, "Sync Failed", time.strftime("%I:%M:%S %p"))
         except Exception as e:
             print(f"[!] Could not write error state: {e}")
 
