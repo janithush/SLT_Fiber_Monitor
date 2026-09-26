@@ -3,15 +3,62 @@ import os
 import sys
 import time
 
+# Anchor all relative files to script folder so Startup/headless runs work
+# even when CWD is System32 or elsewhere. Defined early: the single-instance
+# guard + --refresh signalling below must run before third-party imports so
+# a second launch dies/signals in milliseconds.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRIGGER_FILE = os.path.join(BASE_DIR, "refresh.trigger")
+
+REFRESH_FLAGS = ("--refresh", "--sync-now", "--once", "-refresh", "/refresh")
+WANTS_REFRESH = any((a or "").strip().lower() in REFRESH_FLAGS for a in sys.argv[1:])
+# Filled in by the guard: True when this process owns the mutex.
+_IS_OWNER = False
+# When True (no daemon was running and user passed --refresh), run exactly
+# one fetch cycle then exit instead of entering the daemon loop.
+SINGLE_SHOT = False
+
+
+def request_refresh():
+    """Signal the running daemon to poll immediately (trigger file)."""
+    try:
+        with open(TRIGGER_FILE, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        return True
+    except Exception as e:
+        print(f"[!] Could not write refresh trigger: {e}")
+        return False
+
+
+def consume_refresh_request():
+    """Return True once per trigger file; deletes it so each click = 1 poll."""
+    try:
+        if os.path.exists(TRIGGER_FILE):
+            os.remove(TRIGGER_FILE)
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def _ensure_single_instance():
-    """Exit immediately if another copy is already running.
+    """Single-instance guard with manual-refresh support.
 
-    Kills duplicate-writer races (double-clicks, editor F5, Startup +
-    manual launch). Must run before any third-party imports so duplicates
-    die in milliseconds.
+    - First launch owns ``Global\\SLTMonitorWidgetSingleInstance`` and
+      becomes the daemon (or a one-shot when ``--refresh`` is passed and no
+      daemon is running).
+    - Any later launch (bare double-click OR ``--refresh`` / ``--sync-now``)
+      touches ``refresh.trigger`` so the daemon wakes from its sleep within
+      ~1s and runs an immediate API poll, then exits without disturbing the
+      daemon's mutex/files.
+    Must run before any third-party imports so duplicates die in ms.
     """
+    global _IS_OWNER, SINGLE_SHOT
     if os.name != "nt":
+        _IS_OWNER = True
+        if WANTS_REFRESH:
+            # No guard on POSIX: just do a one-shot fetch.
+            SINGLE_SHOT = True
         return
     try:
         import ctypes
@@ -20,11 +67,32 @@ def _ensure_single_instance():
             None, False, "Global\\SLTMonitorWidgetSingleInstance")
         # Keep a reference alive for the process lifetime.
         _ensure_single_instance._handle = handle
-        if not handle or kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-            print("[!] Another SLTMonitor instance is already running. Exiting.")
+        already_running = (not handle) or (kernel32.GetLastError() == 183)  # ERROR_ALREADY_EXISTS
+        if already_running:
+            # Daemon is active: request an instant poll and get out.
+            # Covers both `main.pyw --refresh` and a bare manual re-launch.
+            if request_refresh():
+                print("[*] Daemon already running: refresh requested (trigger file).")
+            else:
+                print("[!] Another SLTMonitor instance is already running. Exiting.")
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
             os._exit(0)
-    except Exception:
-        pass  # Never block startup on the guard itself.
+        # We are the owner / daemon.
+        _IS_OWNER = True
+        if WANTS_REFRESH:
+            # No daemon was running: run a single fetch and exit so a skin
+            # click always updates variables.inc even if the daemon died.
+            SINGLE_SHOT = True
+    except SystemExit:
+        raise
+    except BaseException:
+        # Never block startup on the guard itself (fail open as daemon).
+        _IS_OWNER = True
+        if WANTS_REFRESH:
+            SINGLE_SHOT = True
 
 
 _ensure_single_instance()
@@ -32,9 +100,8 @@ _ensure_single_instance()
 import requests
 import subprocess
 
-# Anchor all relative files to script folder so Startup/headless runs work
-# even when CWD is System32 or elsewhere.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# BASE_DIR / TRIGGER_FILE already defined above (needed pre-import by the
+# single-instance guard). Remaining paths anchored to the same folder.
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 LOCAL_INC = os.path.join(BASE_DIR, "variables.inc")
@@ -459,7 +526,36 @@ def update_data_cycle():
             print(f"[!] Could not write error state: {e}")
 
 
+def wait_for_next_cycle():
+    """Sleep up to REFRESH_SECONDS, waking early on a refresh.trigger.
+
+    Polls 1s at a time so a skin double-click (-> main.pyw --refresh ->
+    refresh.trigger) starts an immediate poll instead of waiting out the
+    15-minute interval. Returns True when a manual refresh was requested.
+    """
+    for _ in range(REFRESH_SECONDS):
+        time.sleep(1)
+        if consume_refresh_request():
+            print("[*] Manual refresh requested: polling now.")
+            return True
+    return False
+
+
 if __name__ == "__main__":
+    if SINGLE_SHOT:
+        # `main.pyw --refresh` with no daemon running: single fetch, update
+        # variables.inc directly, then exit (no daemon loop, no mutex wait).
+        consume_refresh_request()
+        update_data_cycle()
+        sys.exit(0)
+    # Drop a stale trigger left by a click while the daemon was stopped so
+    # we don't double-poll on startup (first cycle below already fetches).
+    consume_refresh_request()
     while True:
         update_data_cycle()
-        time.sleep(REFRESH_SECONDS)  # 15 min (user choice)
+        # A click that landed mid-fetch already wrote the trigger; consume it
+        # and poll again immediately instead of sleeping a full interval.
+        if consume_refresh_request():
+            print("[*] Manual refresh requested: polling now.")
+            continue
+        wait_for_next_cycle()
