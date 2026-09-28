@@ -14,8 +14,9 @@ REFRESH_FLAGS = ("--refresh", "--sync-now", "--once", "-refresh", "/refresh")
 WANTS_REFRESH = any((a or "").strip().lower() in REFRESH_FLAGS for a in sys.argv[1:])
 # Filled in by the guard: True when this process owns the mutex.
 _IS_OWNER = False
-# When True (no daemon was running and user passed --refresh), run exactly
-# one fetch cycle then exit instead of entering the daemon loop.
+# Deprecated: retained for backward-compat imports only. Auto-promote behavior
+# means a manual launch with no daemon running NEVER exits after one fetch;
+# it always transitions into the daemon loop. Always False now.
 SINGLE_SHOT = False
 
 
@@ -42,23 +43,24 @@ def consume_refresh_request():
 
 
 def _ensure_single_instance():
-    """Single-instance guard with manual-refresh support.
+    """Single-instance guard with auto-promote to daemon.
 
     - First launch owns ``Global\\SLTMonitorWidgetSingleInstance`` and
-      becomes the daemon (or a one-shot when ``--refresh`` is passed and no
-      daemon is running).
+      becomes the daemon. This covers both a bare double-click AND
+      ``--refresh`` / ``--sync-now`` when no daemon is running: it acquires
+      the mutex immediately, performs an initial sync for instant UI
+      feedback, then transitions into the standard background loop
+      (1s trigger polling, 15-min periodic fetches) instead of exiting.
     - Any later launch (bare double-click OR ``--refresh`` / ``--sync-now``)
       touches ``refresh.trigger`` so the daemon wakes from its sleep within
       ~1s and runs an immediate API poll, then exits without disturbing the
       daemon's mutex/files.
     Must run before any third-party imports so duplicates die in ms.
     """
-    global _IS_OWNER, SINGLE_SHOT
+    global _IS_OWNER
     if os.name != "nt":
         _IS_OWNER = True
-        if WANTS_REFRESH:
-            # No guard on POSIX: just do a one-shot fetch.
-            SINGLE_SHOT = True
+        # No guard on POSIX: this process is the daemon (auto-promote).
         return
     try:
         import ctypes
@@ -80,19 +82,20 @@ def _ensure_single_instance():
             except Exception:
                 pass
             os._exit(0)
-        # We are the owner / daemon.
+        # We are the owner / daemon (mutex was free, now acquired).
+        # Auto-promote: even if launched via --refresh with no daemon
+        # running, fall through to the daemon loop below so the system is
+        # never left without a background daemon. The loop's first cycle
+        # does the immediate fetch for instant UI feedback.
         _IS_OWNER = True
         if WANTS_REFRESH:
-            # No daemon was running: run a single fetch and exit so a skin
-            # click always updates variables.inc even if the daemon died.
-            SINGLE_SHOT = True
+            print("[*] No daemon was running: auto-promoting to daemon "
+                  "(initial sync, then background loop).")
     except SystemExit:
         raise
     except BaseException:
         # Never block startup on the guard itself (fail open as daemon).
         _IS_OWNER = True
-        if WANTS_REFRESH:
-            SINGLE_SHOT = True
 
 
 _ensure_single_instance()
@@ -542,12 +545,11 @@ def wait_for_next_cycle():
 
 
 if __name__ == "__main__":
-    if SINGLE_SHOT:
-        # `main.pyw --refresh` with no daemon running: single fetch, update
-        # variables.inc directly, then exit (no daemon loop, no mutex wait).
-        consume_refresh_request()
-        update_data_cycle()
-        sys.exit(0)
+    # Auto-promote fail-safe: the mutex owner (including a manual
+    # `main.pyw --refresh` launched while no daemon was running) always
+    # enters the daemon loop. The first cycle below performs the initial
+    # sync/fetch and updates variables.inc for instant UI feedback, then
+    # the loop continues with 1s trigger polling + 15-min periodic fetches.
     # Drop a stale trigger left by a click while the daemon was stopped so
     # we don't double-poll on startup (first cycle below already fetches).
     consume_refresh_request()
