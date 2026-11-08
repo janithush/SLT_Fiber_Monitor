@@ -1,16 +1,12 @@
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import pathlib
 import subprocess
 import sys
 import time
 from datetime import datetime
-
-# Safe standard stream redirection for pythonw (no console)
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w", encoding="utf-8")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 # ------------------------------------------------------------------------------
 # Paths & Single-Instance Initialization (Pre-import Guard)
@@ -20,6 +16,7 @@ TRIGGER_FILE = BASE_DIR / "refresh.trigger"
 ENV_FILE = BASE_DIR / ".env"
 DATA_FILE = BASE_DIR / "data.json"
 LAPTOP_USAGE_FILE = BASE_DIR / "laptop_usage.json"
+LOG_FILE = BASE_DIR / "daemon.log"
 SKIN_INC = (
     pathlib.Path(os.environ["USERPROFILE"])
     / "Documents"
@@ -34,10 +31,72 @@ LOGIN_URL = "https://myslt.slt.lk/"
 API_BASE = "https://omniscapp.slt.lk/slt/ext/api/BBVAS/UsageSummary"
 REFRESH_SECONDS = 1800  # 30 minutes SLT Portal polling
 LAPTOP_TICK_SECONDS = 60  # 60 seconds local laptop data flush
+AUTH_BACKOFF_SECONDS = 300  # 5 minutes failure cooldown for headless login
 
 REFRESH_FLAGS = ("--refresh", "--sync-now", "--once", "-refresh", "/refresh")
 WANTS_REFRESH = any((a or "").strip().lower() in REFRESH_FLAGS for a in sys.argv[1:])
 _IS_OWNER = False
+_last_auth_attempt_time = 0
+
+# ------------------------------------------------------------------------------
+# Diagnostic Logging Setup (Rotating File + Console / pythonw Stream Redirection)
+# ------------------------------------------------------------------------------
+logger = logging.getLogger("SLTMonitor")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _rf = RotatingFileHandler(
+        LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=1, encoding="utf-8"
+    )
+    _fmt = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    _rf.setFormatter(_fmt)
+    logger.addHandler(_rf)
+
+    if sys.stdout is not None:
+        _ch = logging.StreamHandler(sys.stdout)
+        _ch.setFormatter(_fmt)
+        logger.addHandler(_ch)
+
+
+class _LoggerStream:
+    """Redirect standard stream writes into the rotating logger."""
+
+    def __init__(self, log_func):
+        self._log_func = log_func
+        self._buf = ""
+
+    def write(self, s):
+        if not s:
+            return
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._log_func(line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._log_func(self._buf.strip())
+            self._buf = ""
+
+
+if sys.stdout is None:
+    sys.stdout = _LoggerStream(logger.info)
+if sys.stderr is None:
+    sys.stderr = _LoggerStream(logger.error)
+
+
+def _unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+sys.excepthook = _unhandled_exception
 
 
 def request_refresh():
@@ -47,7 +106,7 @@ def request_refresh():
             f.write(str(time.time()))
         return True
     except Exception as e:
-        print(f"[!] Could not write refresh trigger: {e}")
+        logger.error(f"Could not write refresh trigger: {e}")
         return False
 
 
@@ -89,7 +148,7 @@ def _ensure_single_instance():
             os._exit(0)
         _IS_OWNER = True
         if WANTS_REFRESH:
-            print("[*] Auto-promoting to daemon loop.")
+            logger.info("Auto-promoting to daemon loop.")
     except SystemExit:
         raise
     except BaseException:
@@ -131,7 +190,7 @@ def load_config():
                     if k in cfg:
                         cfg[k] = v.strip().strip('"').strip("'")
     except Exception as e:
-        print(f"[!] Could not read .env: {e}")
+        logger.error(f"Could not read .env: {e}")
     return cfg
 
 
@@ -162,9 +221,9 @@ def save_auth_to_env(authorization=None, cookie=None):
         with open(tmp, "w", encoding="utf-8") as f:
             f.writelines(out)
         os.replace(tmp, str(ENV_FILE))
-        print("[+] .env updated with fresh session.")
+        logger.info(".env updated with fresh session.")
     except Exception as e:
-        print(f"[!] Could not update .env: {e}")
+        logger.error(f"Could not update .env: {e}")
 
 
 # ------------------------------------------------------------------------------
@@ -190,7 +249,7 @@ def load_laptop_usage_state():
                         state["last_counter_bytes"] = None
                     return state
     except Exception as e:
-        print(f"[!] Error reading {LAPTOP_USAGE_FILE.name}: {e}")
+        logger.error(f"Error reading {LAPTOP_USAGE_FILE.name}: {e}")
     return default_state
 
 
@@ -202,7 +261,7 @@ def save_laptop_usage_state(state):
             json.dump(state, f, indent=2)
         os.replace(tmp, str(LAPTOP_USAGE_FILE))
     except Exception as e:
-        print(f"[!] Error saving {LAPTOP_USAGE_FILE.name}: {e}")
+        logger.error(f"Error saving {LAPTOP_USAGE_FILE.name}: {e}")
 
 
 def update_laptop_usage():
@@ -211,7 +270,7 @@ def update_laptop_usage():
         counters = psutil.net_io_counters()
         current_counter = counters.bytes_sent + counters.bytes_recv
     except Exception as e:
-        print(f"[!] psutil net_io_counters error: {e}")
+        logger.error(f"psutil net_io_counters error: {e}")
         return "0.0 GB"
 
     state = load_laptop_usage_state()
@@ -303,27 +362,53 @@ def load_last_good():
                 if isinstance(body, dict) and isinstance(body.get("data"), dict):
                     d = body["data"]
                     if d.get("slt_total_used") or d.get("package_name"):
+                        d["_cached_updated_at"] = (
+                            body.get("updated_at")
+                            or d.get("reported_time")
+                            or ""
+                        )
                         return d
     except Exception:
         pass
     return {
         "package_name": "UNLIMITED HOME",
-        "slt_total_used": "49.2 GB",
-        "status": "NORMAL",
+        "slt_total_used": "0.0 GB",
+        "status": "UNKNOWN",
         "unit": "GB",
+        "_cached_updated_at": "",
     }
 
 
-def write_variables_inc(data, laptop_used, fetch_status, updated_at):
+def write_variables_inc(
+    data,
+    laptop_used,
+    fetch_status,
+    slt_updated_at=None,
+    local_updated_at=None,
+):
     """Write variables.inc atomically (UTF-16 LE with BOM) ONLY to the live skin directory."""
+    if not slt_updated_at:
+        slt_updated_at = (
+            data.get("reported_time")
+            or data.get("_cached_updated_at")
+            or "Unknown"
+        )
+    if not local_updated_at:
+        local_updated_at = time.strftime("%I:%M:%S %p")
+
+    status = data.get("status", "NORMAL")
+    slt_used = data.get("slt_total_used", "0.0 GB")
+
     lines = [
         "[Variables]",
         f"PackageName={sanitize_inc(data.get('package_name', 'UNLIMITED HOME'))}",
-        f"SLTTotalUsed={sanitize_inc(data.get('slt_total_used', '0.0 GB'))}",
+        f"SLTTotalUsed={sanitize_inc(slt_used)}",
         f"LaptopUsed={sanitize_inc(laptop_used)}",
-        f"Status={sanitize_inc(data.get('status', 'NORMAL'))}",
+        f"Status={sanitize_inc(status)}",
         f"Unit={sanitize_inc(data.get('unit', 'GB'))}",
-        f"UpdatedAt={sanitize_inc(updated_at)}",
+        f"SLTUpdatedAt={sanitize_inc(slt_updated_at)}",
+        f"UpdatedAt={sanitize_inc(slt_updated_at)}",
+        f"LocalUpdatedAt={sanitize_inc(local_updated_at)}",
         f"FetchStatus={sanitize_inc(fetch_status)}",
     ]
 
@@ -336,7 +421,7 @@ def write_variables_inc(data, laptop_used, fetch_status, updated_at):
             f.write(content)
         os.replace(tmp, str(SKIN_INC))
     except Exception as e:
-        print(f"[!] Could not write {SKIN_INC}: {e}")
+        logger.error(f"Could not write {SKIN_INC}: {e}")
 
     # Nudge Rainmeter to reload variables immediately
     try:
@@ -352,137 +437,182 @@ def write_variables_inc(data, laptop_used, fetch_status, updated_at):
 
 
 # ------------------------------------------------------------------------------
-# Silent Headless Browser Automation (Playwright + Stealth)
+# Silent Headless Browser Automation (Playwright + Stealth) with Failure Backoff
 # ------------------------------------------------------------------------------
-def get_fresh_auth_headless():
-    """Silent headless Playwright re-authentication with stealth evasions."""
-    print("[*] Launching silent headless browser for session refresh...")
+def can_attempt_auth(force=False):
+    """Check if headless authentication is allowed by the cooldown policy."""
+    global _last_auth_attempt_time
+    if force:
+        return True
+    return (time.time() - _last_auth_attempt_time) >= AUTH_BACKOFF_SECONDS
+
+
+def get_fresh_auth_headless(force=False):
+    """Silent headless Playwright re-authentication with stealth evasions and failure backoff."""
+    global _last_auth_attempt_time
+
+    if not can_attempt_auth(force=force):
+        remaining = int(AUTH_BACKOFF_SECONDS - (time.time() - _last_auth_attempt_time))
+        logger.warning(
+            f"Headless auth cooldown active ({remaining}s remaining). Skipping browser launch."
+        )
+        return None, None
+
+    _last_auth_attempt_time = time.time()
+
+    cfg = load_config()
+    username = cfg.get("SLT_USERNAME") or ""
+    password = cfg.get("SLT_PASSWORD") or ""
+    if not username or not password:
+        logger.warning(
+            "SLT_USERNAME or SLT_PASSWORD not configured in .env; skipping headless login."
+        )
+        return None, None
+
+    logger.info("Launching silent headless browser for session refresh...")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("[!] playwright is not installed. Install with: pip install playwright")
+        logger.error("playwright is not installed. Run: pip install playwright")
         return None, None
 
     captured = {}
     cookie_str = ""
+    p = None
+    browser = None
+    context = None
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-infobars",
-                    "--window-position=0,0",
-                    "--ignore-certificate-errors",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 720},
-            )
-            page = context.new_page()
+        p = sync_playwright().start()
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certificate-errors",
+            ],
+            timeout=30000,
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/130.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+        )
+        context.set_default_timeout(25000)
+        page = context.new_page()
 
-            # Apply stealth evasions
+        # Apply stealth evasions
+        try:
+            from playwright_stealth import Stealth
+
+            stealth = Stealth()
+            stealth.apply_stealth_sync(page)
+        except Exception as e:
+            logger.warning(f"Stealth hook warning: {e}")
+
+        def on_request(req):
             try:
-                from playwright_stealth import Stealth
+                url = req.url or ""
+                if "omniscapp.slt.lk" in url and "UsageSummary" in url:
+                    hdrs = req.headers or {}
+                    auth = hdrs.get("authorization") or hdrs.get("Authorization")
+                    if auth and "authorization" not in captured:
+                        captured["authorization"] = auth
+                        logger.info("Captured fresh Authorization header from API request.")
+            except Exception:
+                pass
 
-                stealth = Stealth()
-                stealth.apply_stealth_sync(page)
-            except Exception as e:
-                print(f"[!] Stealth hook warning: {e}")
+        page.on("request", on_request)
 
-            def on_request(req):
+        try:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            logger.warning(f"Page navigation warning: {e}")
+
+        # Fill credentials
+        try:
+            page.wait_for_timeout(2000)
+            user_input = page.locator(
+                "input[type='text'], input[type='email'], input[name*='user'], input[id*='user'], input[name*='username']"
+            ).first
+            pass_input = page.locator("input[type='password']").first
+            if user_input.is_visible(timeout=5000) and pass_input.is_visible(timeout=5000):
+                user_input.fill(username)
+                pass_input.fill(password)
+                submit_btn = page.locator(
+                    "button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In')"
+                ).first
+                if submit_btn.is_visible(timeout=5000):
+                    submit_btn.click()
+                    logger.info("Credentials submitted on login form.")
+        except Exception as e:
+            logger.warning(f"Auto-fill note: {e}")
+
+        # Wait for UsageSummary request (max 15s)
+        for _ in range(15):
+            page.wait_for_timeout(1000)
+            if captured.get("authorization"):
+                break
+
+        # Fallback: sweep localStorage & sessionStorage for Bearer tokens
+        if "authorization" not in captured:
+            for store_name in ("localStorage", "sessionStorage"):
                 try:
-                    url = req.url or ""
-                    if "omniscapp.slt.lk" in url and "UsageSummary" in url:
-                        hdrs = req.headers or {}
-                        auth = hdrs.get("authorization") or hdrs.get("Authorization")
-                        if auth and "authorization" not in captured:
-                            captured["authorization"] = auth
-                            print("[+] Captured fresh Authorization header.")
-                except Exception:
-                    pass
-
-            page.on("request", on_request)
-
-            try:
-                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                print(f"[!] Page navigation note: {e}")
-
-            # Optional: auto-fill credentials if provided in .env
-            cfg = load_config()
-            username = cfg.get("SLT_USERNAME") or ""
-            password = cfg.get("SLT_PASSWORD") or ""
-            if username and password:
-                try:
-                    page.wait_for_timeout(3000)
-                    user_input = page.locator(
-                        "input[type='text'], input[type='email'], input[name*='user'], input[id*='user'], input[name*='username']"
-                    ).first
-                    pass_input = page.locator("input[type='password']").first
-                    if user_input.is_visible() and pass_input.is_visible():
-                        user_input.fill(username)
-                        pass_input.fill(password)
-                        submit_btn = page.locator(
-                            "button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In')"
-                        ).first
-                        if submit_btn.is_visible():
-                            submit_btn.click()
-                except Exception as e:
-                    print(f"[!] Auto-fill note: {e}")
-
-            # Wait briefly for any UsageSummary requests to trigger
-            for _ in range(15):
-                page.wait_for_timeout(1000)
-                if captured.get("authorization"):
-                    break
-
-            # Fallback: sweep localStorage & sessionStorage for Bearer tokens
-            if "authorization" not in captured:
-                for store_name in ("localStorage", "sessionStorage"):
-                    try:
-                        dump = (
-                            page.evaluate(
-                                f"() => {{ const o={{}}; try {{ for (let i=0;i<{store_name}.length;i++)"
-                                f"{{ const k={store_name}.key(i); o[k]={store_name}.getItem(k); }} }} catch(e) {{}} return o; }}"
-                            )
-                            or {}
+                    dump = (
+                        page.evaluate(
+                            f"() => {{ const o={{}}; try {{ for (let i=0;i<{store_name}.length;i++)"
+                            f"{{ const k={store_name}.key(i); o[k]={store_name}.getItem(k); }} }} catch(e) {{}} return o; }}"
                         )
-                        for k, v in dump.items():
-                            if isinstance(v, str) and len(v) > 60 and (
-                                "bearer" in v.lower()
-                                or v.startswith("4KR")
-                                or "eyJ" in v[:3]
-                            ):
-                                captured["authorization"] = (
-                                    v if v.lower().startswith("bearer") else f"bearer {v}"
-                                )
-                                print(f"[+] Recovered bearer token from {store_name}.")
-                                break
-                        if "authorization" in captured:
+                        or {}
+                    )
+                    for k, v in dump.items():
+                        if isinstance(v, str) and len(v) > 60 and (
+                            "bearer" in v.lower()
+                            or v.startswith("4KR")
+                            or "eyJ" in v[:3]
+                        ):
+                            captured["authorization"] = (
+                                v if v.lower().startswith("bearer") else f"bearer {v}"
+                            )
+                            logger.info(f"Recovered bearer token from {store_name}.")
                             break
-                    except Exception as e:
-                        print(f"[!] Storage sweep note ({store_name}): {e}")
+                    if "authorization" in captured:
+                        break
+                except Exception as e:
+                    logger.warning(f"Storage sweep note ({store_name}): {e}")
 
-            try:
-                cookies = context.cookies()
-                cookie_str = "; ".join(
-                    f"{c['name']}={c['value']}" for c in cookies if c.get("value")
-                )
-            except Exception as e:
-                print(f"[!] Cookie collection note: {e}")
+        try:
+            cookies = context.cookies()
+            cookie_str = "; ".join(
+                f"{c['name']}={c['value']}" for c in cookies if c.get("value")
+            )
+        except Exception as e:
+            logger.warning(f"Cookie collection note: {e}")
 
-            browser.close()
     except Exception as e:
-        print(f"[!] Headless automation error: {e}")
+        logger.error(f"Headless automation error: {e}")
+    finally:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if p:
+            try:
+                p.stop()
+            except Exception:
+                pass
 
     auth = captured.get("authorization")
     if auth or cookie_str:
@@ -496,7 +626,7 @@ def get_fresh_auth_headless():
 def fetch_data(cfg):
     subscriber = (cfg.get("SLT_SUBSCRIBER_ID") or "").strip()
     if not subscriber or "X" in subscriber:
-        print("[!] SLT_SUBSCRIBER_ID missing or unconfigured in .env")
+        logger.error("SLT_SUBSCRIBER_ID missing or unconfigured in .env")
         return None
     url = f"{API_BASE}?subscriberID={subscriber}"
     headers = {
@@ -522,7 +652,7 @@ def fetch_data(cfg):
     try:
         return requests.get(url, headers=headers, timeout=20)
     except Exception as e:
-        print(f"[!] Request exception: {e}")
+        logger.error(f"Request exception: {e}")
         return None
 
 
@@ -549,18 +679,22 @@ def is_session_expired_response(res):
     return False
 
 
-def update_data_cycle(laptop_used):
-    """Execute one SLT portal polling cycle, write live skin feed, and update debug cache."""
+def update_data_cycle(laptop_used, force=False):
+    """Execute one SLT portal polling cycle, write live skin feed, and update debug cache.
+    Returns (data_dict, fetch_status, slt_updated_at)."""
     cfg = load_config()
     res = fetch_data(cfg)
 
     if is_session_expired_response(res):
-        print("[!] Session expired/blocked. Triggering silent headless re-authentication...")
-        get_fresh_auth_headless()
-        cfg = load_config()
-        res = fetch_data(cfg)
+        logger.warning(
+            f"Portal response indicated session expired/blocked (HTTP {res.status_code if res else 'None'}). Triggering re-authentication..."
+        )
+        new_auth, _ = get_fresh_auth_headless(force=force)
+        if new_auth:
+            cfg = load_config()
+            res = fetch_data(cfg)
 
-    now = time.strftime("%I:%M:%S %p")
+    now_local = time.strftime("%I:%M:%S %p")
     if res is not None and res.status_code == 200:
         try:
             payload = res.json()
@@ -569,28 +703,70 @@ def update_data_cycle(laptop_used):
 
         if isinstance(payload, dict) and payload.get("dataBundle"):
             data = parse_usage(payload)
+            slt_sync_time = now_local
 
             # Atomic debug JSON cache
             try:
                 tmp = str(DATA_FILE) + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump({"status": "success", "updated_at": now, "data": data}, f, indent=2)
+                    json.dump(
+                        {"status": "success", "updated_at": slt_sync_time, "data": data},
+                        f,
+                        indent=2,
+                    )
                 os.replace(tmp, str(DATA_FILE))
             except Exception as e:
-                print(f"[!] Could not write {DATA_FILE.name}: {e}")
+                logger.error(f"Could not write {DATA_FILE.name}: {e}")
 
-            write_variables_inc(data, laptop_used, "success", now)
-            print(
-                f"[+] Synced: {data.get('package_name')} | "
+            write_variables_inc(
+                data=data,
+                laptop_used=laptop_used,
+                fetch_status="success",
+                slt_updated_at=slt_sync_time,
+                local_updated_at=now_local,
+            )
+            logger.info(
+                f"Synced: {data.get('package_name')} | "
                 f"SLT Used: {data.get('slt_total_used')} | "
                 f"Laptop: {laptop_used} | "
                 f"Status: {data.get('status')}"
             )
-            return
+            return data, "success", slt_sync_time
 
-    # Always write FetchStatus=success (never stick widget in "Session Expired")
-    last = load_last_good()
-    write_variables_inc(last, laptop_used, "success", now)
+    # --- Truthful Error Reporting (Zero Fake Success) ---
+    if res is not None and res.status_code in (401, 403):
+        error_status = "AUTH_ERROR"
+        fetch_status = "failed"
+    elif res is not None and res.status_code != 200:
+        error_status = "SYNC_FAILED"
+        fetch_status = "failed"
+    else:
+        error_status = "SYNC_FAILED"
+        fetch_status = "failed"
+
+    last_good = load_last_good()
+    cached_slt_time = (
+        last_good.get("reported_time")
+        or last_good.get("_cached_updated_at")
+        or "Unknown"
+    )
+
+    # Truthful reporting: state reflects error, but keeps last known data for display
+    error_data = dict(last_good)
+    error_data["status"] = error_status
+
+    write_variables_inc(
+        data=error_data,
+        laptop_used=laptop_used,
+        fetch_status=fetch_status,
+        slt_updated_at=cached_slt_time,
+        local_updated_at=now_local,
+    )
+    logger.error(
+        f"Portal sync failed (HTTP {res.status_code if res else 'None'}). "
+        f"Emitted truthful state: Status={error_status}, FetchStatus={fetch_status}, LastPortalSync={cached_slt_time}"
+    )
+    return error_data, fetch_status, cached_slt_time
 
 
 # ------------------------------------------------------------------------------
@@ -601,13 +777,15 @@ if __name__ == "__main__":
 
     # Initial sync on daemon startup
     laptop_used = update_laptop_usage()
-    update_data_cycle(laptop_used)
+    current_data, current_fetch_status, current_slt_time = update_data_cycle(
+        laptop_used, force=WANTS_REFRESH
+    )
 
     last_laptop_time = time.time()
     last_portal_time = time.time()
 
-    print(
-        f"[*] Daemon running. SLT portal poll: {REFRESH_SECONDS}s, "
+    logger.info(
+        f"Daemon running. SLT portal poll: {REFRESH_SECONDS}s, "
         f"Laptop usage tick: {LAPTOP_TICK_SECONDS}s, "
         f"IPC trigger: active."
     )
@@ -618,9 +796,11 @@ if __name__ == "__main__":
 
         # Check for fast-path IPC trigger (e.g., skin double-click)
         if consume_refresh_request():
-            print("[*] Manual refresh triggered via IPC.")
+            logger.info("Manual refresh triggered via IPC.")
             laptop_used = update_laptop_usage()
-            update_data_cycle(laptop_used)
+            current_data, current_fetch_status, current_slt_time = update_data_cycle(
+                laptop_used, force=True
+            )
             last_laptop_time = now
             last_portal_time = now
             continue
@@ -629,13 +809,20 @@ if __name__ == "__main__":
         if now - last_laptop_time >= LAPTOP_TICK_SECONDS:
             laptop_used = update_laptop_usage()
             last_laptop_time = now
-            last_data = load_last_good()
             now_str = time.strftime("%I:%M:%S %p")
-            write_variables_inc(last_data, laptop_used, "success", now_str)
+            write_variables_inc(
+                data=current_data,
+                laptop_used=laptop_used,
+                fetch_status=current_fetch_status,
+                slt_updated_at=current_slt_time,
+                local_updated_at=now_str,
+            )
 
         # SLT Portal polling tick (1800 seconds / 30 mins)
         if now - last_portal_time >= REFRESH_SECONDS:
             laptop_used = update_laptop_usage()
-            update_data_cycle(laptop_used)
+            current_data, current_fetch_status, current_slt_time = update_data_cycle(
+                laptop_used, force=False
+            )
             last_laptop_time = now
             last_portal_time = now

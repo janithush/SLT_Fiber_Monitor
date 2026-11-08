@@ -17,4 +17,8 @@ laptop_usage.json
 auth.json
 refresh.trigger
 *.tmp
+*.log
+daemon.log
+*.png
+auth_debug.png
 SLTMonitor.lnk
