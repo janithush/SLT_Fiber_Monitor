@@ -13,6 +13,8 @@ wheels/
 .env
 variables.inc
 data.json
+laptop_usage.json
 auth.json
 refresh.trigger
+*.tmp
 SLTMonitor.lnk
